@@ -135,6 +135,35 @@
       [hidden] {
         display: none !important;
       }
+      .serie {
+        margin-top: 28px;
+        padding-top: 20px;
+        border-top: 1px solid var(--linha);
+      }
+      .serie h2 {
+        font-size: 1.125rem;
+        margin: 0 0 6px;
+      }
+      .ajuda {
+        color: var(--tinta-suave);
+        font-size: 0.9375rem;
+        margin: 0 0 14px;
+      }
+      input[type='number'] {
+        font: inherit;
+        width: 140px;
+        min-height: 48px;
+        padding: 8px 12px;
+        border: 1px solid #aebbb5;
+        border-radius: 8px;
+        background: #fff;
+        color: var(--tinta);
+      }
+      .progresso {
+        font-size: 1.5rem;
+        font-weight: 700;
+        margin: 8px 0 12px;
+      }
     </style>
   </head>
   <body>
@@ -160,6 +189,23 @@
       </div>
 
       <div id="status" role="status" aria-live="polite"></div>
+      <p id="progresso" class="progresso" aria-live="polite" hidden></p>
+      <p id="conferidos" class="progresso" aria-live="polite" hidden></p>
+
+      <section class="serie" aria-labelledby="titulo-serie">
+        <h2 id="titulo-serie">Vários chips (em série)</h2>
+        <p class="ajuda">
+          Para os chips de um pedido: encoste um chip de cada vez. A página conta, não grava duas vezes o mesmo chip e pula os
+          que já têm o link certo.
+        </p>
+        <label for="quantidade" class="rotulo">Quantidade de chips</label>
+        <input id="quantidade" type="number" min="1" step="1" inputmode="numeric" />
+        <div class="acoes">
+          <button type="button" id="iniciar-serie" class="principal" disabled>Começar gravação em série</button>
+          <button type="button" id="conferir-serie" disabled>Conferir vários chips</button>
+          <button type="button" id="parar" hidden>Parar</button>
+        </div>
+      </section>
 
       <details>
         <summary>Como funciona</summary>
@@ -179,23 +225,48 @@
     <script>
       (function () {
         'use strict';
-        var CHAVE = 'link=';
         var elLink = document.getElementById('link');
         var elAviso = document.getElementById('aviso');
         var elSuporte = document.getElementById('suporte');
         var elStatus = document.getElementById('status');
+        var elProgresso = document.getElementById('progresso');
+        var elConferidos = document.getElementById('conferidos');
+        var elQuantidade = document.getElementById('quantidade');
         var btGravar = document.getElementById('gravar');
         var btConferir = document.getElementById('conferir');
+        var btSerie = document.getElementById('iniciar-serie');
+        var btConferirSerie = document.getElementById('conferir-serie');
+        var btParar = document.getElementById('parar');
 
-        // Mesma regra de src/nfc/gravadorCelular.ts (linkDoEndereco).
-        function linkDoEndereco(hash) {
+        // Mesma regra de src/nfc/gravadorCelular.ts (parametrosDoEndereco): "link" vem
+        // codificado, então um "&" dentro do link não se confunde com o "&qtd=".
+        function parametrosDoEndereco(hash) {
           var h = hash.charAt(0) === '#' ? hash.slice(1) : hash;
-          if (h.indexOf(CHAVE) !== 0) return null;
-          try {
-            return decodeURIComponent(h.slice(CHAVE.length));
-          } catch (e) {
-            return null;
+          var r = { link: null, quantidade: null };
+          h.split('&').forEach(function (parte) {
+            var i = parte.indexOf('=');
+            if (i < 0) return;
+            var chave = parte.slice(0, i);
+            var valor = parte.slice(i + 1);
+            if (chave === 'link') {
+              try {
+                r.link = decodeURIComponent(valor);
+              } catch (e) {
+                r.link = null;
+              }
+            } else if (chave === 'qtd' && /^\d+$/.test(valor) && Number(valor) > 0) {
+              r.quantidade = Number(valor);
+            }
+          });
+          return r;
+        }
+
+        function urlDoEvento(evento) {
+          var registros = (evento.message && evento.message.records) || [];
+          for (var i = 0; i < registros.length; i++) {
+            if (registros[i].recordType === 'url') return new TextDecoder(registros[i].encoding || 'utf-8').decode(registros[i].data);
           }
+          return null;
         }
 
         function mostrar(tipo, linhas) {
@@ -220,7 +291,9 @@
           return 'Não foi possível concluir: ' + ((e && e.message) || 'erro desconhecido') + '.';
         }
 
-        var link = linkDoEndereco(location.hash);
+        var parametros = parametrosDoEndereco(location.hash);
+        var link = parametros.link;
+        if (parametros.quantidade) elQuantidade.value = String(parametros.quantidade);
         var linkValido = false;
         if (link === null || link === '') {
           elLink.textContent = '—';
@@ -238,8 +311,128 @@
 
         var temNfc = 'NDEFReader' in window;
         if (!temNfc) elSuporte.hidden = false;
-        btGravar.disabled = !(linkValido && temNfc);
-        btConferir.disabled = !(linkValido && temNfc);
+        var pode = linkValido && temNfc;
+        btGravar.disabled = !pode;
+        btConferir.disabled = !pode;
+        btSerie.disabled = !pode;
+        btConferirSerie.disabled = !pode;
+
+        // ---------- Vários chips em sequência ----------
+        var sessao = null;
+
+        function botoesLivres(livres) {
+          [btGravar, btConferir, btSerie, btConferirSerie].forEach(function (b) {
+            b.disabled = !(livres && pode);
+          });
+          btParar.hidden = livres;
+        }
+
+        function encerrarSessao() {
+          if (sessao) sessao.controle.abort();
+          sessao = null;
+          botoesLivres(true);
+        }
+
+        function plural(n, um, varios) {
+          return n + ' ' + (n === 1 ? um : varios);
+        }
+
+        async function iniciarSessao(s, aoLer) {
+          encerrarSessao();
+          sessao = s;
+          botoesLivres(false);
+          var ndef = new NDEFReader();
+          s.ndef = ndef;
+          ndef.onreading = function (evento) {
+            if (sessao !== s) return;
+            aoLer(evento, evento.serialNumber || 'chip-' + Date.now() + '-' + Math.random());
+          };
+          ndef.onreadingerror = function () {
+            if (sessao === s) mostrar('erro', ['Não foi possível ler este chip. Afaste e encoste de novo.']);
+          };
+          try {
+            await ndef.scan({ signal: s.controle.signal });
+          } catch (e) {
+            mostrar('erro', [explicarErro(e)]);
+            encerrarSessao();
+          }
+        }
+
+        btSerie.addEventListener('click', function () {
+          var alvo = parseInt(elQuantidade.value, 10);
+          if (!(alvo >= 1)) {
+            mostrar('erro', ['Informe quantos chips quer gravar (1 ou mais).']);
+            elQuantidade.focus();
+            return;
+          }
+          var s = { controle: new AbortController(), processados: new Set(), feitos: 0, jaCertos: 0, ocupado: false };
+          var atualizar = function () {
+            elProgresso.hidden = false;
+            elProgresso.textContent = s.feitos + ' de ' + alvo + ' chips prontos';
+          };
+          elConferidos.hidden = true;
+          atualizar();
+          mostrar('aviso', ['Encoste o chip 1 de ' + alvo + ' na parte de trás do celular.']);
+          iniciarSessao(s, async function (evento, serial) {
+            if (s.ocupado) return;
+            if (s.processados.has(serial)) {
+              mostrar('aviso', ['Este chip já foi gravado. Afaste-o e encoste o próximo.']);
+              return;
+            }
+            s.ocupado = true;
+            try {
+              if (urlDoEvento(evento) === link) s.jaCertos += 1;
+              else await s.ndef.write({ records: [{ recordType: 'url', data: link }] });
+              s.processados.add(serial);
+              s.feitos += 1;
+              atualizar();
+              if (s.feitos >= alvo) {
+                var linhas = ['Pronto! ' + plural(alvo, 'chip', 'chips') + ' com o link.'];
+                if (s.jaCertos) linhas.push(s.jaCertos + (s.jaCertos === 1 ? ' já estava' : ' já estavam') + ' com o link certo e não precisou ser regravado.');
+                mostrar('ok', linhas);
+                encerrarSessao();
+              } else {
+                mostrar('ok', ['Chip ' + s.feitos + ' pronto. Afaste-o e encoste o chip ' + (s.feitos + 1) + ' de ' + alvo + '.']);
+              }
+            } catch (e) {
+              mostrar('erro', [explicarErro(e), 'Encoste este chip de novo.']);
+            } finally {
+              s.ocupado = false;
+            }
+          });
+        });
+
+        btConferirSerie.addEventListener('click', function () {
+          var s = { controle: new AbortController(), vistos: new Set(), certos: 0, errados: 0 };
+          var atualizar = function () {
+            elConferidos.hidden = false;
+            elConferidos.textContent = plural(s.certos, 'certo', 'certos') + ', ' + s.errados + ' com outro link ou vazio';
+          };
+          elProgresso.hidden = true;
+          atualizar();
+          mostrar('aviso', ['Encoste os chips um de cada vez. Toque em “Parar” quando terminar.']);
+          iniciarSessao(s, function (evento, serial) {
+            if (s.vistos.has(serial)) {
+              mostrar('aviso', ['Este chip já foi conferido.']);
+              return;
+            }
+            s.vistos.add(serial);
+            var url = urlDoEvento(evento);
+            if (url === link) {
+              s.certos += 1;
+              mostrar('ok', ['Chip certo.']);
+            } else {
+              s.errados += 1;
+              mostrar('erro', url ? ['Este chip tem outro link:', url] : ['Este chip está vazio.']);
+            }
+            atualizar();
+          });
+        });
+
+        btParar.addEventListener('click', function () {
+          encerrarSessao();
+          mostrar('aviso', ['Leitura encerrada.']);
+        });
 
         btGravar.addEventListener('click', async function () {
           btGravar.disabled = true;
@@ -277,14 +470,7 @@
             };
             ndef.onreading = function (evento) {
               terminar();
-              var registros = (evento.message && evento.message.records) || [];
-              var url = null;
-              for (var i = 0; i < registros.length; i++) {
-                if (registros[i].recordType === 'url') {
-                  url = new TextDecoder(registros[i].encoding || 'utf-8').decode(registros[i].data);
-                  break;
-                }
-              }
+              var url = urlDoEvento(evento);
               if (url === link) mostrar('ok', ['O chip contém exatamente este link.']);
               else if (url) mostrar('erro', ['Atenção: o chip tem outro link:', url, 'Toque em “Gravar no chip” para gravar o link correto.']);
               else mostrar('erro', ['O chip não tem nenhum link gravado.']);
